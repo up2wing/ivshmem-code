@@ -14,7 +14,8 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/proc_fs.h>
-#include <linux/smp_lock.h>
+// #include <linux/smp_lock.h>
+#include <linux/hardirq.h>
 #include <asm/uaccess.h>
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
@@ -60,7 +61,7 @@ static kvm_ivshmem_device kvm_ivshmem_dev;
 
 static int device_major_nr;
 
-static int kvm_ivshmem_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
+static long kvm_ivshmem_ioctl(struct file *, unsigned int, unsigned long);
 static int kvm_ivshmem_mmap(struct file *, struct vm_area_struct *);
 static int kvm_ivshmem_open(struct inode *, struct file *);
 static int kvm_ivshmem_release(struct inode *, struct file *);
@@ -75,7 +76,7 @@ static const struct file_operations kvm_ivshmem_ops = {
 	.open	= kvm_ivshmem_open,
 	.mmap	= kvm_ivshmem_mmap,
 	.read	= kvm_ivshmem_read,
-	.ioctl   = kvm_ivshmem_ioctl,
+	.unlocked_ioctl   = kvm_ivshmem_ioctl,
 	.write   = kvm_ivshmem_write,
 	.llseek  = kvm_ivshmem_lseek,
 	.release = kvm_ivshmem_release,
@@ -98,12 +99,13 @@ static struct pci_driver kvm_ivshmem_pci_driver = {
 	.remove	  = kvm_ivshmem_remove_device,
 };
 
-static int kvm_ivshmem_ioctl(struct inode * ino, struct file * filp,
+static long kvm_ivshmem_ioctl(struct file * filp,
 			unsigned int cmd, unsigned long arg)
 {
 
 	int rv;
 	uint32_t msg;
+    void __user *argp = (void __user *)arg;
 
 	printk("KVM_IVSHMEM: args is %ld\n", arg);
 #if 1
@@ -132,13 +134,13 @@ static int kvm_ivshmem_ioctl(struct inode * ino, struct file * filp,
 			break;
 		case wait_event_irq:
 			msg = ((arg & 0xff) << 8) + (cmd & 0xff);
-			printk("KVM_IVSHMEM: ringing wait_event doorbell on %d (msg = %d)\n", arg, msg);
+			printk("KVM_IVSHMEM: ringing wait_event doorbell on %lu (msg = %d)\n", arg, msg);
 			writel(msg, kvm_ivshmem_dev.regs + Doorbell);
 			break;
 		case read_ivposn:
 			msg = readl( kvm_ivshmem_dev.regs + IVPosition);
 			printk("KVM_IVSHMEM: my posn is %d\n", msg);
-			rv = copy_to_user(arg, &msg, sizeof(msg));
+			rv = copy_to_user(argp, &msg, sizeof(msg));
 			break;
 		case sema_irq:
 			// 2 is the actual code, but we use 7 from the user
@@ -192,12 +194,14 @@ static loff_t kvm_ivshmem_lseek(struct file * filp, loff_t offset, int origin)
 	switch (origin) {
 		case 1:
 			offset += filp->f_pos;
+            break;
 		case 0:
 			retval = offset;
 			if (offset > kvm_ivshmem_dev.ioaddr_size) {
 				offset = kvm_ivshmem_dev.ioaddr_size;
 			}
 			filp->f_pos = offset;
+            break;
 	}
 
 	return retval;
@@ -279,8 +283,8 @@ static int request_msix_vectors(struct kvm_ivshmem_device *ivs_info, int nvector
 	for (i = 0; i < nvectors; ++i)
 		ivs_info->msix_entries[i].entry = i;
 
-	err = pci_enable_msix(ivs_info->dev, ivs_info->msix_entries,
-					ivs_info->nvectors);
+	err = pci_enable_msix_range(ivs_info->dev, ivs_info->msix_entries,
+					ivs_info->nvectors, ivs_info->nvectors);
 	if (err > 0) {
 		printk(KERN_INFO "no MSI. Back to INTx.\n");
 		return -ENOSPC;
@@ -456,14 +460,13 @@ static int kvm_ivshmem_release(struct inode * inode, struct file * filp)
    return 0;
 }
 
+#define VM_RESERVED (VM_DONTEXPAND|VM_DONTDUMP)
 static int kvm_ivshmem_mmap(struct file *filp, struct vm_area_struct * vma)
 {
 
 	unsigned long len;
 	unsigned long off;
 	unsigned long start;
-
-	lock_kernel();
 
 	off = vma->vm_pgoff << PAGE_SHIFT;
 	start = kvm_ivshmem_dev.ioaddr;
@@ -475,24 +478,21 @@ static int kvm_ivshmem_mmap(struct file *filp, struct vm_area_struct * vma)
 	printk(KERN_INFO "%lu > %lu\n",(vma->vm_end - vma->vm_start + off), len);
 
 	if ((vma->vm_end - vma->vm_start + off) > len) {
-		unlock_kernel();
 		return -EINVAL;
 	}
 
 	off += start;
 	vma->vm_pgoff = off >> PAGE_SHIFT;
 
-	vma->vm_flags |= VM_SHARED|VM_RESERVED;
+    vm_flags_set(vma, VM_SHARED|VM_RESERVED);
 
 	if(io_remap_pfn_range(vma, vma->vm_start,
 		off >> PAGE_SHIFT, vma->vm_end - vma->vm_start,
 		vma->vm_page_prot))
 	{
 		printk("mmap failed\n");
-		unlock_kernel();
 		return -ENXIO;
 	}
-	unlock_kernel();
 
 	return 0;
 }
